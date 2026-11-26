@@ -1,111 +1,99 @@
-// Ship the front page this repository commits to /output/entry.png, and prove that the
-// bytes which land are the bytes in the commit. Node 22, standard library only; the
-// competition's sandbox has no network and does not promise a working directory, so every
-// path is resolved from this file's own location.
+// Entry for make.fun's news-image-20261125: ship the page this repository holds.
 //
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-//
-// The image is one 1024x1024 PNG drawn by render.py from the day's own wire scan: thirty
-// stories of Wednesday 25 November 2026, 00:00-23:59 UTC, nine regions. This program does
-// not draw it; it holds the committed file to the competition's gate and copies it, so a
-// run is a byte copy and two runs are byte-identical.
-
-import { mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+// The picture is the broadsheet drawn by render7.py from our own scan of the day's wire
+// feeds and committed as entry.png. This program is what the sandbox runs: it holds the
+// committed bytes to the competition's gate (signature, every chunk's CRC, IHDR, size),
+// writes them to $MAKEFUN_OUTPUT_DIR/entry.png, reads the copy back and prints the sha256
+// of what it wrote. Two runs write the same bytes and print the same hash.
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { crc32, inflateSync } from "node:zlib";
+import { inflateSync } from "node:zlib";
 
-const HERE = fileURLToPath(new URL(".", import.meta.url));
-const SOURCE = join(HERE, "entry.png");
-const MAX_BYTES = 1048576;
-const SIDE = 1024;
+const here = new URL(".", import.meta.url).pathname;
+const png = readFileSync(join(here, "entry.png"));
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 
-function fail(why: string): never {
-  console.error("entry refused: " + why);
-  process.exit(1);
+// CRC32 over a buffer, as PNG defines it
+const TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
 }
 
-// --- the file is a whole PNG: signature, every chunk with its checksum, the image data its
-// header describes. The gate reads exactly these bytes, so this checks exactly this file.
-const bytes = readFileSync(SOURCE);
-if (bytes.length > MAX_BYTES) fail(`file is ${bytes.length} B, cap is ${MAX_BYTES} B`);
-if (bytes.length < 8 || bytes.readUInt32BE(0) !== 0x89504e47 || bytes.readUInt32BE(4) !== 0x0d0a1a0a) {
-  fail("no PNG signature");
-}
+// 1. signature
+const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+if (png.subarray(0, 8).compare(sig) !== 0) throw new Error("entry.png is not a PNG");
 
+// 2. every chunk, end to end: length, type, data, CRC -- and IEND at the last byte
 let at = 8;
+let first = true;
+let idat = [];
+let sawPalette = false;
 let width = 0;
 let height = 0;
 let depth = 0;
-let colour = 0;
-let idat: Buffer[] = [];
-let sawIhdr = false;
-let sawIend = false;
-while (at + 12 <= bytes.length) {
-  const len = bytes.readUInt32BE(at);
-  const type = bytes.toString("latin1", at + 4, at + 8);
-  const body = bytes.subarray(at + 8, at + 8 + len);
-  const crcAt = at + 8 + len;
-  if (crcAt + 4 > bytes.length) fail(`chunk ${type} runs past the end of the file`);
-  const want = bytes.readUInt32BE(crcAt);
-  const got = crc32(Buffer.concat([Buffer.from(type, "latin1"), body])) >>> 0;
-  if (want !== got) fail(`chunk ${type} checksum ${got} != ${want}`);
-  if (type === "IHDR") {
-    sawIhdr = true;
-    width = body.readUInt32BE(0);
-    height = body.readUInt32BE(4);
-    depth = body[8];
-    colour = body[9];
-  } else if (type === "IDAT") {
-    idat.push(body);
-  } else if (type === "IEND") {
-    sawIend = true;
-    at = crcAt + 4;
+let colour = -1;
+let sawEnd = false;
+while (at + 12 <= png.length) {
+  const len = png.readUInt32BE(at);
+  const type = png.subarray(at + 4, at + 8).toString("latin1");
+  if (at + 12 + len > png.length) throw new Error("truncated chunk " + type);
+  const data = png.subarray(at + 8, at + 8 + len);
+  const crc = png.readUInt32BE(at + 8 + len);
+  const want = crc32(png.subarray(at + 4, at + 8 + len));
+  if (crc !== want) throw new Error("bad CRC in " + type);
+  if (first) {
+    if (type !== "IHDR" || len !== 13) throw new Error("first chunk is not IHDR");
+    width = data.readUInt32BE(0);
+    height = data.readUInt32BE(4);
+    depth = data[8];
+    colour = data[9];
+    first = false;
+  }
+  if (type === "IDAT") idat.push(data);
+  if (type === "PLTE") sawPalette = true;
+  if (type === "IEND") {
+    sawEnd = true;
+    if (at + 12 + len !== png.length) throw new Error("bytes after IEND");
     break;
   }
-  at = crcAt + 4;
+  at += 12 + len;
 }
-if (!sawIhdr || !sawIend) fail("missing IHDR or IEND");
-if (width > SIDE || height > SIDE || width === 0 || height === 0) {
-  fail(`image is ${width}x${height}, the cap is ${SIDE}x${SIDE}`);
-}
-if (depth !== 8) fail(`bit depth ${depth}, expected 8`);
+if (first) throw new Error("no IHDR");
+if (!sawEnd) throw new Error("no IEND");
+if (!idat.length) throw new Error("no IDAT");
 
-// the pixel data must inflate to exactly one filter byte and one pixel row per row; a
-// palette image (colour type 3) carries one index per pixel at this bit depth, not one bit
-const channels = colour === 0 ? 1 : colour === 2 ? 3 : colour === 3 ? 1 : colour === 4 ? 2 : 4;
-const rowBytes = Math.ceil((width * channels * depth) / 8);
-const rows = height * (1 + rowBytes);
-let raw: Buffer;
-try {
-  raw = inflateSync(Buffer.concat(idat));
-} catch (e) {
-  fail("image data does not inflate: " + (e as Error).message);
-}
-if (raw.length !== rows) fail(`image data is ${raw.length} B, header says ${rows} B`);
+// 3. the gate's own limits: one 1024x1024 image of at most 1 MiB, 8-bit channels
+if (width !== 1024 || height !== 1024) throw new Error(`size ${width}x${height} is not 1024x1024`);
+if (depth !== 8) throw new Error("bit depth " + depth + " is not 8");
+if (png.length > 1048576) throw new Error("entry.png is over 1 MiB");
 
-// --- copy, then read the copy back: the bytes that land must be the bytes committed
-const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+// 4. the image data has to inflate to exactly the rows the header describes
+const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colour];
+if (channels === undefined) throw new Error("unknown colour type " + colour);
+if (colour === 3 && !sawPalette) throw new Error("palette image without PLTE");
+const raw = inflateSync(Buffer.concat(idat));
+const rows = height * (1 + Math.ceil((width * channels * depth) / 8));
+if (raw.length !== rows) throw new Error(`image data ${raw.length} B, header asks ${rows} B`);
+
+// 5. write it, read it back, and print what landed
 mkdirSync(outDir, { recursive: true });
-const target = join(outDir, "entry.png");
-writeFileSync(target, bytes);
-const landed = readFileSync(target);
-if (!landed.equals(bytes)) fail("the written file differs from the committed one");
-if (statSync(target).size !== bytes.length) fail("the written file is a different size");
-// a second write has to land the same bytes, so the run is repeatable
-const first = readFileSync(target);
-writeFileSync(target, bytes);
-if (!readFileSync(target).equals(first)) fail("two writes of the same bytes differ");
+const dest = join(outDir, "entry.png");
+writeFileSync(dest, png);
+const back = readFileSync(dest);
+if (back.length !== png.length || back.compare(png) !== 0) throw new Error("copy differs");
+const sha = createHash("sha256").update(back).digest("hex");
+console.log(`entry.png ${width}x${height} ${png.length} B sha256 ${sha}`);
 
-// --- a quick read of the head of the file, so a truncated copy cannot pass silently
-const fd = openSync(target, "r");
-const head = Buffer.alloc(33);
-readSync(fd, head, 0, 33, 0);
-if (head.readUInt32BE(16) !== width || head.readUInt32BE(20) !== height) {
-  fail("the copied file's header does not name the size that was checked");
-}
 
-console.log(
-  `entry.png ${bytes.length} B, ${width}x${height}, colour type ${colour}, ` +
-    `idat ${idat.length} chunk(s), ${raw.length} B of pixels -> ${target}`,
-);
